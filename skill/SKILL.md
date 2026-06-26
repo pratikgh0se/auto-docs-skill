@@ -79,6 +79,19 @@ First time (file missing): ask once — "No ARCHITECTURE.md found. Generate one?
 
 Update strategy: update only affected section(s). Never full rewrite.
 
+**Visual diagrams (REQUIRED when applicable):** When updating ARCHITECTURE.md, include at least one diagram if the change involves any of:
+- New component, service, module, or layer → system/component diagram
+- Data flow or request lifecycle → sequence or flow diagram
+- Relationships between entities → ER or class diagram
+- State machine or process flow → state or flowchart diagram
+- Deployment topology → deployment diagram
+
+Format selection — pick based on diagram type:
+- **Mermaid** (preferred): use for flowcharts (`graph`), sequence diagrams (`sequenceDiagram`), ER diagrams (`erDiagram`), class diagrams (`classDiagram`), state diagrams (`stateDiagram-v2`). Renders natively in GitHub/GitLab.
+- **ASCII art**: fallback only when Mermaid cannot represent the structure adequately.
+
+Place diagrams inside their relevant section, not at end of file. One focused diagram per concept — don't combine unrelated systems into one diagram.
+
 ---
 
 ### docs/USAGE.md
@@ -146,7 +159,7 @@ The Stop hook fires after every Claude turn. Auto-docs is invoked when work is d
 1. Check .claude/no-docs → skip if present
 2. Detect work: files_changed OR bash_ran OR agents_ran?
 3. No work detected → skip silently (pure Q&A)
-4. Work detected → AskUserQuestion: "Document this work?"
+4. Work detected → use AskUserQuestion tool: question="Document this work?", options=["Yes", "No"]
 5. No → skip
 6. Yes → fan out parallel haiku agents (see Agent Architecture)
 7. Check MR state: MR closed since last feature entry? → "Feature complete? Add feature summary?"
@@ -264,3 +277,4 @@ Then for each missing doc, ask once: `"No [FILE] found. Initialize it?"`
 | Creating docs in repos with `.claude/no-docs` | Check toggle first |
 | Committing WORKLOG.md | Must be in .gitignore |
 | Doc agents using session model | Hardcode haiku model always |
+| Updating ARCHITECTURE.md without diagrams on structural changes | Add Mermaid diagram to relevant section |
