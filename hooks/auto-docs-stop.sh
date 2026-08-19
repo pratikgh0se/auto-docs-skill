@@ -1,67 +1,71 @@
 #!/usr/bin/env bash
-# Auto-docs Stop hook — detects meaningful work, prompts Claude to document it
-# Receives JSON on stdin from Claude Code Stop hook event
+# Auto-docs Stop hook. It only detects Git work and asks Claude to decide
+# whether documentation is warranted; session state is deliberately external
+# to the repository.
 
 set -euo pipefail
 
 INPUT=$(cat)
+STOP_HOOK_ACTIVE=$(jq -r '.stop_hook_active // false' <<< "$INPUT" 2>/dev/null || printf 'false')
+[ "$STOP_HOOK_ACTIVE" = 'true' ] && exit 0
 
-# Bug 1: Skip when hook is firing during its own processing loop
-STOP_HOOK_ACTIVE=$(echo "$INPUT" | jq -r '.stop_hook_active // false' 2>/dev/null || echo "false")
-[ "$STOP_HOOK_ACTIVE" = "true" ] && exit 0
+WORKING_DIR=$(jq -r '.cwd // empty' <<< "$INPUT" 2>/dev/null || true)
+SESSION_ID=$(jq -r '.session_id // empty' <<< "$INPUT" 2>/dev/null || true)
+[ -n "$WORKING_DIR" ] || WORKING_DIR=$(pwd)
 
-# Extract fields from hook JSON
-WORKING_DIR=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null || echo "")
-SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null || echo "")
+REPO_ROOT=$(git -C "$WORKING_DIR" rev-parse --show-toplevel 2>/dev/null || true)
+[ -n "$REPO_ROOT" ] || exit 0
+[ -f "$REPO_ROOT/.claude/no-docs" ] && exit 0
+CANONICAL_REPO_ROOT=$(cd -P -- "$REPO_ROOT" && pwd)
 
-# Fall back to pwd if cwd not in hook data
-[ -z "$WORKING_DIR" ] && WORKING_DIR=$(pwd)
-
-# Skip if toggle present
-if [ -f "$WORKING_DIR/.claude/no-docs" ]; then
-  exit 0
-fi
-
-# Skip if not a git repo
-if ! git -C "$WORKING_DIR" rev-parse --git-dir > /dev/null 2>&1; then
-  exit 0
-fi
-
-# Bug 2: Skip if already asked this session (deduplication)
-if [ -n "$SESSION_ID" ]; then
-  SENTINEL="$WORKING_DIR/.claude/auto-docs-asked-$SESSION_ID"
-  if [ -f "$SENTINEL" ]; then
-    exit 0
-  fi
-fi
-
-# Bug 3: Only use files_changed as work signal (cumulative transcript tool count is unreliable)
-FILES_CHANGED=0
-if git -C "$WORKING_DIR" rev-parse HEAD > /dev/null 2>&1; then
-  STAGED=$(git -C "$WORKING_DIR" diff --cached --name-only 2>/dev/null | wc -l | tr -d ' ')
-  UNSTAGED=$(git -C "$WORKING_DIR" diff --name-only 2>/dev/null | wc -l | tr -d ' ')
-  FILES_CHANGED=$((STAGED + UNSTAGED))
-fi
-
-# No changed files — pure Q&A or already committed, skip silently
-if [ "$FILES_CHANGED" -eq 0 ]; then
-  exit 0
-fi
-
-# Write sentinel so hook won't fire again this session
-if [ -n "$SESSION_ID" ]; then
-  mkdir -p "$WORKING_DIR/.claude"
-  touch "$WORKING_DIR/.claude/auto-docs-asked-$SESSION_ID"
-fi
-
-# Emit via hookSpecificOutput.additionalContext for reliable model injection
-cat << EOF
-{
-  "hookSpecificOutput": {
-    "hookEventName": "Stop",
-    "additionalContext": "MANDATORY: auto-docs detected work this turn (files_changed=$FILES_CHANGED, working_dir=$WORKING_DIR). You MUST invoke the auto-docs skill NOW and ask the user: 'Document this work?' before responding to anything else."
-  }
+canonicalize_missing_path() {
+  local target="$1" parent leaf suffix=''
+  while [ ! -e "$target" ]; do
+    [ "$target" = '/' ] && return 1
+    leaf=${target##*/}
+    parent=${target%/*}
+    [ -n "$parent" ] || parent='/'
+    suffix="/$leaf$suffix"
+    target=$parent
+  done
+  [ -d "$target" ] || return 1
+  printf '%s%s\n' "$(cd -P -- "$target" && pwd)" "$suffix"
 }
-EOF
 
-exit 0
+is_outside_repository() {
+  case "$1" in
+    "$CANONICAL_REPO_ROOT"|"$CANONICAL_REPO_ROOT"/*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Porcelain status works for tracked, staged, untracked, and repositories
+# without an initial commit. Count records rather than trying to infer work
+# from a transcript or from diff against HEAD.
+STATUS=$(git -C "$REPO_ROOT" status --porcelain=v1 --untracked-files=all 2>/dev/null || true)
+[ -n "$STATUS" ] || exit 0
+FILES_CHANGED=$(printf '%s\n' "$STATUS" | wc -l | tr -d ' ')
+
+if [ -n "$SESSION_ID" ]; then
+  case "${HOME:-}" in
+    /*) DEFAULT_STATE_BASE="$HOME/.local/state" ;;
+    *) exit 0 ;;
+  esac
+  case "${XDG_STATE_HOME:-}" in
+    /*) STATE_BASE="$XDG_STATE_HOME" ;;
+    *) STATE_BASE="$DEFAULT_STATE_BASE" ;;
+  esac
+  STATE_DIR=$(canonicalize_missing_path "$STATE_BASE/claude-auto-docs" || true)
+  if [ -z "$STATE_DIR" ] || ! is_outside_repository "$STATE_DIR"; then
+    STATE_DIR=$(canonicalize_missing_path "$DEFAULT_STATE_BASE/claude-auto-docs" || true)
+  fi
+  [ -n "$STATE_DIR" ] && is_outside_repository "$STATE_DIR" || exit 0
+  STATE_KEY=$(printf '%s\0%s' "$REPO_ROOT" "$SESSION_ID" | shasum -a 256 | awk '{print $1}')
+  SENTINEL="$STATE_DIR/$STATE_KEY"
+  mkdir -p "$STATE_DIR"
+  mkdir "$SENTINEL" 2>/dev/null || exit 0
+fi
+
+jq -cn \
+  --arg context "MANDATORY: auto-docs detected work this turn (files_changed=$FILES_CHANGED, working_dir=$REPO_ROOT). You MUST invoke the auto-docs skill NOW and ask the user: 'Document this work?' before responding to anything else." \
+  '{hookSpecificOutput:{hookEventName:"Stop",additionalContext:$context}}'

@@ -1,280 +1,135 @@
 ---
 name: auto-docs
-description: Use when working in any git project — governs automatic documentation triggered by Stop hook, commit gate, and explicit invocation. Skip if `.claude/no-docs` exists in project root.
+description: Use when documenting Git project work after a coding session, commit, structural or interface change, significant confirmed decision, or confirmed feature completion.
 ---
 
 # Auto-Docs v2
 
-Maintain five living documents per project. Triggered by Stop hook (per-turn), commit gate, and explicit invocation.
+Keep project documentation current without treating a Git hook as an LLM or
+claiming that a dynamic workflow can prompt a user mid-run.
 
-## Toggle
+## Safety gate
+
+Resolve the Git root first. If `<root>/.claude/no-docs` exists, stop silently.
+Never write through symlinked documentation or state paths. Never stage
+`docs/WORKLOG.md`.
+
+The distributable hooks and workflow are source artifacts. Installing them in
+global Claude settings, Git templates, or another repository is a separate,
+explicit action.
+
+## Executable components
+
+### Stop hook
+
+`auto-docs-stop.sh` reads the supported Stop payload fields `cwd`,
+`session_id`, and `stop_hook_active`. When porcelain Git status finds tracked,
+staged, or untracked work, it emits `hookSpecificOutput.additionalContext` once
+per repository/session. Deduplication state lives outside the project under
+`${XDG_STATE_HOME:-$HOME/.local/state}/claude-auto-docs`.
+
+The Stop hook does not update docs or question the user itself. On receiving
+its context, ask `Document this work?`. Run `auto-docs-write` only after the
+user agrees.
+
+### Commit hooks
+
+- `auto-docs-pre-commit.sh` records deterministic staged-file information in
+  `docs/CHANGELOG.md` and stages that file in the same commit. It performs no
+  network access.
+- `auto-docs-post-commit.sh` optionally replaces one bounded AI Review Context
+  block in an open GitLab merge request. It requires `GITLAB_TOKEN`, skips
+  `main` and `master`, and sends the token only to an exact host in
+  `AUTO_DOCS_GITLAB_HOSTS` (default `gitlab.com`).
+- `auto-docs-prepare-commit-msg.sh` is a deprecated, silent, non-mutating
+  compatibility hook. Install it alongside pre-commit and post-commit so a
+  stale legacy version cannot stage another CHANGELOG edit after Git captures
+  the commit tree.
+
+All project hooks honor `.claude/no-docs`.
+
+### Documentation workflow
+
+Invoke `auto-docs-write` with:
+
+```json
+{
+  "workingDir": "/absolute/project/path",
+  "sessionSummary": "User-confirmed summary of this work",
+  "commitBoundary": "optional-exclusive-lower-commit",
+  "decision": {
+    "confirmed": true,
+    "title": "Decision title",
+    "context": "Why a choice was needed",
+    "decision": "What was chosen and why",
+    "alternativesConsidered": "Other options and why rejected",
+    "consequences": "What this choice shapes"
+  }
+}
+```
+
+`commitBoundary` and `decision` are optional. Supply `decision` only after the
+user explicitly confirms capture; all five text fields are required when
+`confirmed` is `true`. The workflow ignores incomplete or unconfirmed decision
+objects. It never asks for confirmation in process.
+
+The workflow runs these phases:
+
+1. A bootstrap agent honors the opt-out, creates `docs/WORKLOG.md`, adds exactly
+   one `docs/WORKLOG.md` ignore rule, and initializes tracked state at
+   `.claude/auto-docs-state.json`.
+2. A detector reads working-tree paths, HEAD, the optional boundary, and
+   `lastProcessedCommit` from the cursor.
+3. Haiku agents update only the documents whose conditions apply.
+4. After every planned writer succeeds, a checkpoint agent advances and stages
+   the cursor to the newest processed commit.
+
+The workflow is idempotent: WORKLOG sessions and commit-derived CHANGELOG
+entries use stable markers, and the cursor limits later runs to commits after
+the recorded SHA. `docs/WORKLOG.md` stays ignored; CHANGELOG, ARCHITECTURE,
+USAGE, DECISIONS, `.gitignore`, and cursor state are deliberately stageable.
+
+## Document conditions
+
+| File | Condition | Behavior |
+| --- | --- | --- |
+| `docs/WORKLOG.md` | Every confirmed workflow run | Append one deduplicated session entry; never stage |
+| `docs/CHANGELOG.md` | Commits exist after boundary/cursor | Add only unseen commit entries under Unreleased |
+| `docs/ARCHITECTURE.md` | Non-test source structure changed | Create if missing or update affected sections; include a focused Mermaid diagram when applicable |
+| `docs/USAGE.md` | API, route, CLI, handler, service, or similar interface path changed | Create if missing or update affected sections |
+| `docs/DECISIONS.md` | Complete `decision.confirmed: true` metadata supplied | Append the user-confirmed decision; never infer one |
+
+Agents read existing documents before writing, preserve unrelated content, use
+the pinned Haiku model, and do not commit.
+
+## User-confirmed feature summaries
+
+Git does not prove that a merge request closed. First verify merged/closed
+state through the configured GitLab tool or API. Then ask the user to confirm
+the title and one-line summary. Only after confirmation, run from anywhere in
+the project:
 
 ```bash
-[ -f .claude/no-docs ] && echo "SKIP" || echo "PROCEED"
+bash /path/to/auto-docs-feature-complete.sh \
+  --id 'https://gitlab.com/group/project/-/merge_requests/42' \
+  --title 'Reliable auto-docs' \
+  --summary 'Made documentation updates deterministic and safe.'
 ```
 
-- Present → skip all doc actions silently
-- "stop docs" → `touch .claude/no-docs`
-- "start docs" / "enable docs" → `rm .claude/no-docs`
-
----
-
-## The Five Documents
-
-All docs live in `docs/` at project root.
-
-| File | Trigger | Mode |
-|------|---------|------|
-| `docs/CHANGELOG.md` | Commit gate | Auto |
-| `docs/ARCHITECTURE.md` | Structural change | Auto (ask first time) |
-| `docs/USAGE.md` | Interface change | Auto (ask first time) |
-| `docs/DECISIONS.md` | Significant decision | Ask every time |
-| `docs/WORKLOG.md` | Stop hook, MR close | Auto (session) + prompted (feature) |
-
-`docs/WORKLOG.md` is always added to `.gitignore`. Never commit it.
-
----
-
-### docs/CHANGELOG.md
-
-Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
-
-```markdown
-## [Unreleased]
-
-### Added
-- Payment webhook — chose idempotency key over dedup table for simpler rollback
-
-### Changed
-- Auth module — removed session token storage (compliance)
-
-### Fixed
-- Race condition in async handler — missing await on DB write
-```
-
-Write before commit. Stage with other files. One line per logical change, include WHY for non-obvious choices.
-
-Skip if: typo/formatting, WIP marker, test fixtures with no logic change, merge commit.
-
----
-
-### docs/ARCHITECTURE.md
-
-Living system overview. Written for a new engineer joining the project.
-
-```markdown
-# Architecture
-
-## What This Is
-## System Overview
-## Key Design Principles
-## Data Model
-## External Dependencies
-## Known Constraints & Tradeoffs
-```
-
-Auto-update on: new service/module/layer, core data model change, significant dependency change, component responsibility shift.
-
-First time (file missing): ask once — "No ARCHITECTURE.md found. Generate one?"
-
-Update strategy: update only affected section(s). Never full rewrite.
-
-**Visual diagrams (REQUIRED when applicable):** When updating ARCHITECTURE.md, include at least one diagram if the change involves any of:
-- New component, service, module, or layer → system/component diagram
-- Data flow or request lifecycle → sequence or flow diagram
-- Relationships between entities → ER or class diagram
-- State machine or process flow → state or flowchart diagram
-- Deployment topology → deployment diagram
-
-Format selection — pick based on diagram type:
-- **Mermaid** (preferred): use for flowcharts (`graph`), sequence diagrams (`sequenceDiagram`), ER diagrams (`erDiagram`), class diagrams (`classDiagram`), state diagrams (`stateDiagram-v2`). Renders natively in GitHub/GitLab.
-- **ASCII art**: fallback only when Mermaid cannot represent the structure adequately.
-
-Place diagrams inside their relevant section, not at end of file. One focused diagram per concept — don't combine unrelated systems into one diagram.
-
----
-
-### docs/USAGE.md
-
-Practical guide: setup, run, configure, deploy, API/CLI reference.
-
-Auto-update on: new CLI command/flag, API endpoint change, new required env var, setup change, deployment config change, new prerequisite.
-
-First time (file missing): ask once.
-
-Update strategy: update only affected section(s).
-
----
-
-### docs/DECISIONS.md
-
-Append-only log of significant decisions. Always ask before writing — never auto-write.
-
-```markdown
-## [DATE] Decision Title
-
-**Context:** What prompted this.
-**Decision:** What was chosen and why.
-**Alternatives considered:** What else, why rejected.
-**Consequences:** What this shapes going forward.
-```
-
-Ask when: architecture choice made, significant tradeoff accepted, non-obvious pattern adopted.
-
-Prompt: `"Significant decision on [topic]. Capture in DECISIONS.md?"`
-
----
-
-### docs/WORKLOG.md — Session + Feature entries
-
-**Session entry** (auto on Stop hook):
-
-```markdown
-## Session: YYYY-MM-DD
-
-**What I worked on:** Brief summary.
-**Challenges:** Technical blockers and how resolved.
-**Outcome:** State of code after session.
-```
-
-**Feature entry** (prompted on MR close, or once per session if no MR workflow):
-
-```markdown
-## Feature: <Name> [YYYY-MM-DD]
-
-**Problem:** What was broken or missing.
-**Solution:** How solved, key technical decisions.
-**Effort:** Rough estimate (hours/days).
-**Impact:** What it unblocks or improves.
-**Technical challenges:** Non-obvious things worth remembering.
-```
-
----
-
-## Stop Hook Workflow
-
-The Stop hook fires after every Claude turn. Auto-docs is invoked when work is detected.
-
-```
-1. Check .claude/no-docs → skip if present
-2. Detect work: files_changed OR bash_ran OR agents_ran?
-3. No work detected → skip silently (pure Q&A)
-4. Work detected → use AskUserQuestion tool: question="Document this work?", options=["Yes", "No"]
-5. No → skip
-6. Yes → fan out parallel haiku agents (see Agent Architecture)
-7. Check MR state: MR closed since last feature entry? → "Feature complete? Add feature summary?"
-```
-
----
-
-## Commit Gate Workflow
-
-Runs via `prepare-commit-msg` git hook in the project repo.
-
-```
-1. Check .claude/no-docs → skip if present
-2. Trivial commit? → skip all docs
-3. Update docs/CHANGELOG.md → stage it
-4. Structural change? → update docs/ARCHITECTURE.md → stage it
-5. Interface change? → update docs/USAGE.md → stage it
-6. On feature branch with open MR? → update MR description (AI Review Context block)
-```
-
----
-
-## Agent Architecture
-
-Parallel haiku agents, one per doc:
-
-```
-User confirms "Document this work?"
-  → Workflow (haiku, caveman ultra)
-    ├── Agent A: docs/CHANGELOG.md  (if commits present)
-    ├── Agent B: docs/ARCHITECTURE.md  (if structural change)
-    ├── Agent C: docs/USAGE.md  (if interface change)
-    ├── Agent D: docs/DECISIONS.md  (only if decision confirmed this session)
-    └── Agent E: docs/WORKLOG.md  (always — session entry)
-```
-
-Each agent:
-- `model: "global.anthropic.claude-haiku-4-5-20251001-v1:0"`
-- Caveman ultra system prompt
-- Uses `rtk` for all shell/git commands
-- Reads existing doc first, appends/updates — never full rewrite
-- Writes only its assigned file
-
----
-
-## MR Description Format
-
-Commit gate appends once, updates on subsequent commits (never duplicates block):
-
-```markdown
----
-## AI Review Context
-
-**Changes in this MR:**
-- Bullet per logical change
-
-**Key decisions & tradeoffs:**
-- Decision: chose X over Y because Z
-
-**Known limitations / follow-ups:**
-- ...
-
-**Full context:** `docs/ARCHITECTURE.md`, `docs/DECISIONS.md`
-```
-
-Sourced from `docs/DECISIONS.md` entries since branch creation. Omits sections with no data. Only runs on feature branches with open MR — skips `main`/`master`.
-
----
-
-## Project Bootstrap (first run in a project)
-
-When auto-docs first runs in a project, execute:
-
-```bash
-# 1. Create docs/ if missing
-mkdir -p docs
-
-# 2. Add WORKLOG.md to .gitignore (dedup-safe)
-grep -q 'docs/WORKLOG.md' .gitignore 2>/dev/null || echo 'docs/WORKLOG.md' >> .gitignore
-
-# 3. Inject CLAUDE.md entry (dedup-safe)
-grep -q '# Auto-Docs' CLAUDE.md 2>/dev/null || cat >> CLAUDE.md << 'EOF'
-
-# Auto-Docs
-Docs live in `docs/`. Update them when making changes.
-Run auto-docs skill or answer Yes to "Document this work?" prompt.
-EOF
-
-# 4. Merge permissions into .claude/settings.json
-mkdir -p .claude
-[ -f .claude/settings.json ] || echo '{}' > .claude/settings.json
-jq '.permissions.allow += ["Read(*)", "Bash(ls:*)", "Bash(cat:*)", "Bash(git diff*)", "Bash(git log*)", "Bash(git status*)", "Bash(rtk git*)", "Write(docs/*)", "Edit(docs/*)"] | .permissions.allow |= unique' \
-  .claude/settings.json > /tmp/settings-merged.json && mv /tmp/settings-merged.json .claude/settings.json
-
-# 5. Install prepare-commit-msg git hook (only needed for existing repos cloned before global template was set)
-# New git init/clone picks up hook automatically via ~/.git-templates
-if [ ! -f ".git/hooks/prepare-commit-msg" ]; then
-  cp ~/.claude/hooks/auto-docs-prepare-commit-msg.sh .git/hooks/prepare-commit-msg
-  chmod +x .git/hooks/prepare-commit-msg
-fi
-```
-
-Then for each missing doc, ask once: `"No [FILE] found. Initialize it?"`
-
----
-
-## Common Mistakes
-
-| Mistake | Fix |
-|---------|-----|
-| Writing DECISIONS.md without asking | Always ask first, every time |
-| Rewriting full doc on small change | Update only affected section |
-| Updating CHANGELOG after commit | Stage with the commit |
-| Skipping ARCHITECTURE/USAGE on structural/interface changes | Check diff triggers |
-| Creating docs in repos with `.claude/no-docs` | Check toggle first |
-| Committing WORKLOG.md | Must be in .gitignore |
-| Doc agents using session model | Hardcode haiku model always |
-| Updating ARCHITECTURE.md without diagrams on structural changes | Add Mermaid diagram to relevant section |
+`--id`, `--title`, and `--summary` are required exactly once. The command
+rejects unsafe input before writing, honors `.claude/no-docs`, ensures the
+WORKLOG ignore rule, and appends at most one feature entry for the confirmed
+merge request URL or ID. Retrying the same ID does not replace the original
+confirmed entry.
+
+## Common mistakes
+
+- Do not claim the workflow prompts the user; collect confirmation before
+  invocation.
+- Do not infer a significant decision or merge-request closure.
+- Do not use post-commit for deterministic same-commit CHANGELOG staging.
+- Do not leave the legacy mutating `prepare-commit-msg` hook active; replace it
+  with the shipped non-mutating compatibility hook.
+- Do not send a GitLab token to a host outside the explicit allowlist.
+- Do not commit `docs/WORKLOG.md` or store Stop-hook session sentinels in the
+  project.
