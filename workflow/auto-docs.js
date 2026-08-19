@@ -26,6 +26,8 @@ const safeRepoPath = value => safeLine(value) && !value.startsWith('/') &&
 const safePathArray = value => Array.isArray(value) && value.length <= 10000 && value.every(safeRepoPath)
 const safeDocBasenames = value => Array.isArray(value) && value.length <= 1000 &&
   value.every(name => safeLine(name) && !name.includes('/'))
+const isStructuralFile = file => /\.(go|py|ts|tsx|js|jsx|java|rs|rb|cs|cpp|c|h|kt|swift)$/.test(file)
+const isInterfaceFile = file => /(api|route|endpoint|cli|cmd|handler|controller|service|grpc|proto)/i.test(file)
 const validDetectorContext = value => value && typeof value === 'object' &&
   /^\d{4}-\d{2}-\d{2}$/.test(value.date) &&
   safePathArray(value.filesChanged) && safePathArray(value.stagedFiles) &&
@@ -174,21 +176,16 @@ const commitsAfterCursor = Array.isArray(context.commitsAfterCursor) ? context.c
 const allChanged = [...new Set(filesChanged.concat(stagedFiles))]
 const existingDocs = Array.isArray(context.existingDocs) ? context.existingDocs : []
 const hasCommits = commitsAfterCursor.length > 0
-const hasStructuralChange = allChanged.some(file =>
-  /\.(go|py|ts|tsx|js|jsx|java|rs|rb|cs|cpp|c|h|kt|swift)$/.test(file) &&
-  !/(test|spec|mock)/i.test(file)
-)
-const hasInterfaceChange = allChanged.some(file =>
-  /(api|route|endpoint|cli|cmd|handler|controller|service|grpc|proto)/i.test(file)
-)
+const hasStructuralChange = allChanged.some(file => isStructuralFile(file) && !/(test|spec|mock)/i.test(file))
+const hasInterfaceChange = allChanged.some(isInterfaceFile)
 
 log(`Branch: ${context.currentBranch} | Files: ${allChanged.length} | New commits: ${commitsAfterCursor.length} | Structural: ${hasStructuralChange} | Interface: ${hasInterfaceChange}`)
 
 phase('Write')
-const agentTasks = []
-const writerPaths = []
+const writers = []
+const addWriter = (stagedPath, run) => writers.push({ stagedPath, run })
 
-agentTasks.push(() => agent(
+addWriter(null, () => agent(
   `${CAVEMAN}
 
 ${UNTRUSTED_NOTICE}
@@ -208,10 +205,9 @@ Read the file first. If the exact session marker already exists, make no change.
 Return ok:true only after verifying the required final file state; otherwise return ok:false with error.`,
   { label: 'write:worklog', phase: 'Write', model: HAIKU, tools: WRITER_TOOLS, schema: WRITER_RESULT_SCHEMA }
 ))
-writerPaths.push(null)
 
 if (hasCommits) {
-  agentTasks.push(() => agent(
+  addWriter('docs/CHANGELOG.md', () => agent(
     `${CAVEMAN}
 
 ${UNTRUSTED_NOTICE}
@@ -223,12 +219,11 @@ Read the file first. Ensure a Keep a Changelog style ## [Unreleased] section. Fo
 Do not stage or commit. Return ok:true only after verifying the required final file state; otherwise return ok:false with error.`,
     { label: 'write:changelog', phase: 'Write', model: HAIKU, tools: WRITER_TOOLS, schema: WRITER_RESULT_SCHEMA }
   ))
-  writerPaths.push('docs/CHANGELOG.md')
 }
 
 if (hasStructuralChange) {
-  const structuralFiles = allChanged.filter(file => /\.(go|py|ts|tsx|js|jsx|java|rs|rb|cs|cpp|c|h|kt|swift)$/.test(file))
-  agentTasks.push(() => agent(
+  const structuralFiles = allChanged.filter(isStructuralFile)
+  addWriter('docs/ARCHITECTURE.md', () => agent(
     `${CAVEMAN}
 
 ${UNTRUSTED_NOTICE}
@@ -244,12 +239,11 @@ Read before writing. If missing, create the documented architecture sections. If
 Do not stage or commit. Return ok:true only after verifying the required final file state; otherwise return ok:false with error.`,
     { label: 'write:architecture', phase: 'Write', model: HAIKU, tools: WRITER_TOOLS, schema: WRITER_RESULT_SCHEMA }
   ))
-  writerPaths.push('docs/ARCHITECTURE.md')
 }
 
 if (hasInterfaceChange) {
-  const interfaceFiles = allChanged.filter(file => /(api|route|endpoint|cli|cmd|handler|controller|service|grpc|proto)/i.test(file))
-  agentTasks.push(() => agent(
+  const interfaceFiles = allChanged.filter(isInterfaceFile)
+  addWriter('docs/USAGE.md', () => agent(
     `${CAVEMAN}
 
 ${UNTRUSTED_NOTICE}
@@ -265,11 +259,10 @@ Read before writing. If missing, create a practical guide. If present, edit only
 Do not stage or commit. Return ok:true only after verifying the required final file state; otherwise return ok:false with error.`,
     { label: 'write:usage', phase: 'Write', model: HAIKU, tools: WRITER_TOOLS, schema: WRITER_RESULT_SCHEMA }
   ))
-  writerPaths.push('docs/USAGE.md')
 }
 
 if (confirmedDecision) {
-  agentTasks.push(() => agent(
+  addWriter('docs/DECISIONS.md', () => agent(
     `${CAVEMAN}
 
 ${UNTRUSTED_NOTICE}
@@ -281,12 +274,13 @@ Read before writing. Append one entry using those exact fields. If an identical 
 Do not stage or commit. Return ok:true only after verifying the required final file state; otherwise return ok:false with error.`,
     { label: 'write:decisions', phase: 'Write', model: HAIKU, tools: WRITER_TOOLS, schema: WRITER_RESULT_SCHEMA }
   ))
-  writerPaths.push('docs/DECISIONS.md')
 }
 
-const results = await parallel(agentTasks)
+const results = await parallel(writers.map(writer => writer.run))
 const succeeded = results.filter(result => result && result.ok === true).length
-const pathsToStage = writerPaths.filter((path, index) => path && results[index] && results[index].ok === true)
+const pathsToStage = writers.flatMap((writer, index) =>
+  writer.stagedPath && results[index] && results[index].ok === true ? [writer.stagedPath] : []
+)
 let stagingSucceeded = pathsToStage.length === 0
 let cursorAdvanced = false
 
@@ -304,7 +298,7 @@ Task: From workingDir, stage exactly the repository-relative paths listed in the
   stagingSucceeded = Boolean(stageResult && stageResult.ok === true)
 }
 
-if (hasCommits && context.headSha && succeeded === agentTasks.length && stagingSucceeded) {
+if (hasCommits && context.headSha && succeeded === writers.length && stagingSucceeded) {
   phase('Checkpoint')
   const cursorResult = await agent(
     `${CAVEMAN}
@@ -321,7 +315,7 @@ Return ok:true only after reading back the expected SHA and verifying the state 
   cursorAdvanced = Boolean(cursorResult && cursorResult.ok === true)
 }
 
-log(`Done: ${succeeded}/${agentTasks.length} doc agents succeeded; cursor advanced: ${cursorAdvanced}`)
+log(`Done: ${succeeded}/${writers.length} doc agents succeeded; cursor advanced: ${cursorAdvanced}`)
 return {
   docsUpdated: succeeded,
   date: context.date,

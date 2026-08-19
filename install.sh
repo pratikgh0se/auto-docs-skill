@@ -111,18 +111,30 @@ validate_template_dir "$TEMPLATE_DIR"
 CLAUDE_DIR="$HOME/.claude"
 SETTINGS_FILE="$CLAUDE_DIR/settings.json"
 STOP_COMMAND='$HOME/.claude/hooks/auto-docs-stop.sh'
-declare -a COPIES=(
-  "skill/SKILL.md|$CLAUDE_DIR/skills/auto-docs/SKILL.md|0644"
-  "workflow/auto-docs.js|$CLAUDE_DIR/workflows/auto-docs.js|0644"
-  "hooks/auto-docs-stop.sh|$CLAUDE_DIR/hooks/auto-docs-stop.sh|0755"
-  "hooks/auto-docs-pre-commit.sh|$CLAUDE_DIR/hooks/auto-docs-pre-commit.sh|0755"
-  "hooks/auto-docs-post-commit.sh|$CLAUDE_DIR/hooks/auto-docs-post-commit.sh|0755"
-  "hooks/auto-docs-feature-complete.sh|$CLAUDE_DIR/hooks/auto-docs-feature-complete.sh|0755"
-  "hooks/auto-docs-prepare-commit-msg.sh|$CLAUDE_DIR/hooks/auto-docs-prepare-commit-msg.sh|0755"
-  "hooks/auto-docs-pre-commit.sh|$TEMPLATE_DIR/hooks/pre-commit|0755"
-  "hooks/auto-docs-post-commit.sh|$TEMPLATE_DIR/hooks/post-commit|0755"
-  "hooks/auto-docs-prepare-commit-msg.sh|$TEMPLATE_DIR/hooks/prepare-commit-msg|0755"
+declare -a COPY_SOURCES=(
+  skill/SKILL.md workflow/auto-docs.js hooks/auto-docs-stop.sh
+  hooks/auto-docs-pre-commit.sh hooks/auto-docs-post-commit.sh
+  hooks/auto-docs-feature-complete.sh hooks/auto-docs-prepare-commit-msg.sh
+  hooks/auto-docs-pre-commit.sh hooks/auto-docs-post-commit.sh
+  hooks/auto-docs-prepare-commit-msg.sh
 )
+declare -a COPY_DESTINATIONS=(
+  "$CLAUDE_DIR/skills/auto-docs/SKILL.md" "$CLAUDE_DIR/workflows/auto-docs.js" "$CLAUDE_DIR/hooks/auto-docs-stop.sh"
+  "$CLAUDE_DIR/hooks/auto-docs-pre-commit.sh" "$CLAUDE_DIR/hooks/auto-docs-post-commit.sh"
+  "$CLAUDE_DIR/hooks/auto-docs-feature-complete.sh" "$CLAUDE_DIR/hooks/auto-docs-prepare-commit-msg.sh"
+  "$TEMPLATE_DIR/hooks/pre-commit" "$TEMPLATE_DIR/hooks/post-commit" "$TEMPLATE_DIR/hooks/prepare-commit-msg"
+)
+declare -a COPY_MODES=(0644 0644 0755 0755 0755 0755 0755 0755 0755 0755)
+
+copy_count=${#COPY_SOURCES[@]}
+[ "$copy_count" -eq "${#COPY_DESTINATIONS[@]}" ] && [ "$copy_count" -eq "${#COPY_MODES[@]}" ] \
+  || die 'internal copy manifest is inconsistent'
+copy_fields() {
+  local index="$1"
+  source="${COPY_SOURCES[$index]}"
+  destination="${COPY_DESTINATIONS[$index]}"
+  mode="${COPY_MODES[$index]}"
+}
 
 validate_destination() {
   local target="$1" boundary="$2" parent
@@ -167,8 +179,8 @@ settings_rendered() {
 
 # Complete preflight: no target, ancestor, source, or settings path is accepted
 # until all targets are safe to replace.
-for item in "${COPIES[@]}"; do
-  IFS='|' read -r source destination mode <<< "$item"
+for ((index = 0; index < copy_count; index++)); do
+  copy_fields "$index"
   case "$destination" in
     "$TEMPLATE_DIR"/*) validate_destination "$destination" "$TEMPLATE_DIR" ;;
     *) validate_destination "$destination" "$HOME" ;;
@@ -184,19 +196,17 @@ CURRENT_TEMPLATE=$(git_global --get init.templateDir 2>/dev/null || true)
 
 declare -a COPY_CHANGED=()
 ANY_CHANGED=$((SETTINGS_CHANGED + GIT_CONFIG_CHANGED))
-for item in "${COPIES[@]}"; do
-  IFS='|' read -r source destination mode <<< "$item"
+for ((index = 0; index < copy_count; index++)); do
+  copy_fields "$index"
   if desired_copy_change "$REPO_DIR/$source" "$destination" "$mode"; then COPY_CHANGED+=(1); ANY_CHANGED=$((ANY_CHANGED + 1)); else COPY_CHANGED+=(0); fi
 done
 
 if [ "$MODE" = '--dry-run' ]; then
   printf 'Auto-Docs installation dry run (no files or configuration will change)\n'
   printf '  source checkout: %s\n' "$REPO_DIR"
-  index=0
-  for item in "${COPIES[@]}"; do
-    IFS='|' read -r source destination mode <<< "$item"
+  for ((index = 0; index < copy_count; index++)); do
+    copy_fields "$index"
     if [ "${COPY_CHANGED[$index]}" -eq 1 ]; then printf '  REPLACE %s -> %s (mode %s)\n' "$source" "$destination" "$mode"; else printf '  KEEP %s\n' "$destination"; fi
-    index=$((index + 1))
   done
   [ "$SETTINGS_CHANGED" -eq 1 ] && printf '  MERGE Stop hook registration into %s\n' "$SETTINGS_FILE" || printf '  KEEP Stop hook registration in %s\n' "$SETTINGS_FILE"
   [ "$GIT_CONFIG_CHANGED" -eq 1 ] && printf '  SET default global git init.templateDir -> %s\n' "$TEMPLATE_DIR" || printf '  KEEP default global git init.templateDir -> %s\n' "$TEMPLATE_DIR"
@@ -216,6 +226,24 @@ MANIFEST="$BACKUP_DIR/manifest.tsv"
 ROLLBACK="$BACKUP_DIR/rollback.sh"
 TRANSACTION_RESTORE="$BACKUP_DIR/.transaction-restore.sh"
 printf 'index\tstate\ttarget\tmode\n' > "$MANIFEST"
+emit_restore_function() {
+  cat <<'EOF'
+restore() {
+  local state="$1" target="$2" backup="$3" mode="$4"
+  if [ "$state" = absent ]; then
+    [ ! -e "$target" ] || [ -f "$target" ] || { printf 'rollback refuses non-file target: %s\n' "$target" >&2; return 1; }
+    rm -f -- "$target"
+  else
+    mkdir -p "$(dirname "$target")"
+    [ ! -e "$target" ] || [ -f "$target" ] || { printf 'rollback refuses non-file target: %s\n' "$target" >&2; return 1; }
+    rm -f -- "$target"
+    cp -p -- "$backup" "$target"
+    chmod "$mode" "$target"
+  fi
+}
+EOF
+}
+
 cat > "$ROLLBACK" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -237,37 +265,10 @@ check_target() {
   [ "$current_digest" = "$digest" ] && [ "$current_mode" = "$mode" ] \
     || { printf 'rollback refuses drifted target: %s\n' "$target" >&2; return 1; }
 }
-restore() {
-  local state="$1" target="$2" backup="$3" mode="$4"
-  if [ "$state" = absent ]; then
-    [ ! -e "$target" ] || [ -f "$target" ] || { printf 'rollback refuses non-file target: %s\n' "$target" >&2; return 1; }
-    rm -f -- "$target"
-  else
-    mkdir -p "$(dirname "$target")"
-    [ ! -e "$target" ] || [ -f "$target" ] || { printf 'rollback refuses non-file target: %s\n' "$target" >&2; return 1; }
-    rm -f -- "$target"
-    cp -p -- "$backup" "$target"
-    chmod "$mode" "$target"
-  fi
-}
 EOF
-cat > "$TRANSACTION_RESTORE" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-restore() {
-  local state="$1" target="$2" backup="$3" mode="$4"
-  if [ "$state" = absent ]; then
-    [ ! -e "$target" ] || [ -f "$target" ] || return 1
-    rm -f -- "$target"
-  else
-    mkdir -p "$(dirname "$target")"
-    [ ! -e "$target" ] || [ -f "$target" ] || return 1
-    rm -f -- "$target"
-    cp -p -- "$backup" "$target"
-    chmod "$mode" "$target"
-  fi
-}
-EOF
+emit_restore_function >> "$ROLLBACK"
+printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' > "$TRANSACTION_RESTORE"
+emit_restore_function >> "$TRANSACTION_RESTORE"
 
 declare -a TARGET_STATES=()
 declare -a TARGET_MODES=()
@@ -292,7 +293,11 @@ record_target() {
 
 # Record every target, not only changed ones, before the first mutation.
 record_index=0
-for item in "${COPIES[@]}"; do IFS='|' read -r source destination mode <<< "$item"; record_target "$destination" "$record_index"; record_index=$((record_index + 1)); done
+for ((index = 0; index < copy_count; index++)); do
+  copy_fields "$index"
+  record_target "$destination" "$record_index"
+  record_index=$((record_index + 1))
+done
 record_target "$SETTINGS_FILE" "$record_index"; record_index=$((record_index + 1))
 record_target "$GIT_CONFIG_FILE" "$record_index"
 printf 'git_init_template_dir\t%s\n' "$CURRENT_TEMPLATE" >> "$MANIFEST"
@@ -307,25 +312,21 @@ rollback_on_error() {
 trap 'rollback_on_error $?' ERR INT TERM
 
 # Stage all output before touching destinations.
-index=0
-for item in "${COPIES[@]}"; do
-  IFS='|' read -r source destination mode <<< "$item"
+for ((index = 0; index < copy_count; index++)); do
+  copy_fields "$index"
   if [ "${COPY_CHANGED[$index]}" -eq 1 ]; then
     cp -P -- "$REPO_DIR/$source" "$BACKUP_DIR/stage/copy-$index"
     chmod "$mode" "$BACKUP_DIR/stage/copy-$index"
   fi
-  index=$((index + 1))
 done
 if [ "$SETTINGS_CHANGED" -eq 1 ]; then printf '%s\n' "$SETTINGS_RENDERED" > "$BACKUP_DIR/stage/settings.json"; chmod 0600 "$BACKUP_DIR/stage/settings.json"; fi
 
-index=0
-for item in "${COPIES[@]}"; do
-  IFS='|' read -r source destination mode <<< "$item"
+for ((index = 0; index < copy_count; index++)); do
+  copy_fields "$index"
   if [ "${COPY_CHANGED[$index]}" -eq 1 ]; then
     mkdir -p "$(dirname "$destination")"
     mv -f "$BACKUP_DIR/stage/copy-$index" "$destination"
   fi
-  index=$((index + 1))
 done
 if [ "$SETTINGS_CHANGED" -eq 1 ]; then mkdir -p "$(dirname "$SETTINGS_FILE")"; mv -f "$BACKUP_DIR/stage/settings.json" "$SETTINGS_FILE"; fi
 if [ "$GIT_CONFIG_CHANGED" -eq 1 ]; then git_global init.templateDir "$TEMPLATE_DIR"; fi
